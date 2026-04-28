@@ -1,0 +1,25 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# Scrypto
+.transactions/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+keys/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
