@@ -1,22 +1,18 @@
-# Rust / Cargo
+# Rust build artifacts
 target/
 **/*.rs.bk
 
-# Scrypto
-.transactions/
+# Scrypto artifacts
+*.wasm
+*.rpd
+*.schema
 
-# Environment / secrets
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-secrets/
-keys/
+# Resim state
+~/.simulator/
 
-# IDE
-.idea/
+# Editor
 .vscode/
+.idea/
 *.swp
 *.swo
 
