@@ -1,6 +1,7 @@
 use scrypto::prelude::*;
 
 #[blueprint]
+#[events(TreasuryDisbursementEvent, EmergencyLockEvent)]
 mod treasury_module {
     enable_method_auth! {
         roles {
