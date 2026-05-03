@@ -8,7 +8,15 @@ pub struct StakePosition {
     pub multiplier: Decimal,
 }
 
+#[derive(ScryptoSbor, ScryptoEvent)]
+pub struct RheoConsumedEvent {
+    pub account: ComponentAddress,
+    pub amount: Decimal,
+    pub epoch: u64,
+}
+
 #[blueprint]
+#[events(RheoConsumedEvent)]
 mod staking_module {
     enable_method_auth! {
         roles {
@@ -155,8 +163,6 @@ mod staking_module {
             (component, admin_badge.into(), protocol_badge.into())
         }
 
-        /// Stake FOAF -> receive vFOAF (flexible, 1:1)
-        /// caller: the account address staking (passed explicitly for resim + dApp compat)
         pub fn stake_vfoaf(&mut self, foaf_bucket: Bucket, caller: ComponentAddress) -> Bucket {
             assert!(
                 foaf_bucket.resource_address() == self.foaf_resource,
@@ -182,7 +188,6 @@ mod staking_module {
             self.vfoaf_manager.mint(amount).into()
         }
 
-        /// Stake FOAF -> receive rFOAF (time-locked, multiplier 1.0x-4.0x)
         pub fn stake_rfoaf(
             &mut self,
             foaf_bucket: Bucket,
@@ -224,7 +229,6 @@ mod staking_module {
             self.rfoaf_manager.mint(amount).into()
         }
 
-        /// Unstake vFOAF -> return FOAF
         pub fn unstake_vfoaf(
             &mut self,
             vfoaf_bucket: Bucket,
@@ -240,7 +244,6 @@ mod staking_module {
             self.foaf_vault.take(amount)
         }
 
-        /// Unstake rFOAF -> return FOAF (only after lock expired)
         pub fn unstake_rfoaf(
             &mut self,
             rfoaf_bucket: Bucket,
@@ -272,12 +275,10 @@ mod staking_module {
             self.foaf_vault.take(foaf_amount)
         }
 
-        /// View: all stake positions for an account
         pub fn get_stake_position(&self, account: ComponentAddress) -> Vec<StakePosition> {
             self.stake_positions.get(&account).map(|p| p.clone()).unwrap_or_default()
         }
 
-        /// View: compute accrued RHEO (lazy — not stored, computed on demand)
         pub fn get_accrued_rheo(&self, account: ComponentAddress) -> Decimal {
             let current_epoch = Runtime::current_epoch().number();
             let positions = self.stake_positions.get(&account)
@@ -288,7 +289,6 @@ mod staking_module {
             })
         }
 
-        /// Consume RHEO within same manifest (lazy accrual + burn pattern)
         pub fn consume_rheo(&mut self, account: ComponentAddress, amount_needed: Decimal) {
             let available = self.get_accrued_rheo(account);
             assert!(
@@ -307,8 +307,6 @@ mod staking_module {
         pub fn update_foaf_address(&mut self, new_addr: ResourceAddress) {
             self.foaf_resource = new_addr;
         }
-
-        // ===== INTERNAL =====
 
         fn remove_stake_position(
             &mut self,
@@ -355,11 +353,4 @@ mod staking_module {
             self.stake_positions.insert(account, positions);
         }
     }
-}
-
-#[derive(ScryptoSbor, ScryptoEvent)]
-pub struct RheoConsumedEvent {
-    pub account: ComponentAddress,
-    pub amount: Decimal,
-    pub epoch: u64,
 }
