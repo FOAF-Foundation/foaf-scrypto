@@ -120,7 +120,7 @@ mod governance_module {
         rfoaf_resource: ResourceAddress,
 
         /// Voter identity badge resource address
-        voter_badge_resource: ResourceAddress,
+
 
         /// Staking component — for qualifying_count() queries
         staking_component: ComponentAddress,
@@ -140,7 +140,7 @@ mod governance_module {
     impl FoafGovernance {
         pub fn instantiate(
             rfoaf_resource: ResourceAddress,
-            voter_badge_resource: ResourceAddress,
+    
             staking_component: ComponentAddress,
             admin_badge: ResourceAddress,
             council_badge: ResourceAddress,
@@ -149,7 +149,7 @@ mod governance_module {
                 Runtime::allocate_component_address(FoafGovernance::blueprint_id());
             Self {
                 rfoaf_resource,
-                voter_badge_resource,
+    
                 staking_component,
                 proposals: KeyValueStore::new(),
                 proposal_count: 0,
@@ -170,6 +170,15 @@ mod governance_module {
 
         /// Submit a proposal.
         /// Requires: voter badge proof (identity) + rFOAF proof >= tier.proposal_threshold()
+        fn get_voter_badge_res(&self) -> ResourceAddress {
+            let raw: Vec<u8> = ScryptoVmV1Api::object_call(
+                self.staking_component.as_node_id(),
+                "voter_badge_resource",
+                scrypto_args!(),
+            );
+            scrypto_decode::<ResourceAddress>(&raw).unwrap()
+        }
+
         pub fn submit_proposal(
             &mut self,
             title: String,
@@ -178,13 +187,12 @@ mod governance_module {
             voter_badge_proof: Proof,
             rfoaf_proof: Proof,
         ) -> u64 {
-            // Verify voter identity badge
-            let badge_checked = voter_badge_proof.check(self.voter_badge_resource);
+            let vbr = self.get_voter_badge_res();
+            let badge_checked = voter_badge_proof.check(vbr);
             let voter_ids = badge_checked.as_non_fungible().non_fungible_local_ids();
             assert!(voter_ids.len() == 1, "Must provide exactly one voter badge");
             let voter_id = voter_ids.into_iter().next().unwrap();
 
-            // Verify rFOAF balance meets proposal threshold
             let rfoaf_balance = rfoaf_proof.check(self.rfoaf_resource).amount();
             assert!(
                 rfoaf_balance >= tier.proposal_threshold(),
@@ -213,8 +221,6 @@ mod governance_module {
             id
         }
 
-        /// Cast a vote. Identity bound to voter badge local_id — unforgeable.
-        /// One vote per badge per proposal.
         pub fn vote(
             &mut self,
             proposal_id: u64,
@@ -222,13 +228,12 @@ mod governance_module {
             voter_badge_proof: Proof,
             rfoaf_proof: Proof,
         ) {
-            // Verify voter identity
-            let badge_checked = voter_badge_proof.check(self.voter_badge_resource);
+            let vbr = self.get_voter_badge_res();
+            let badge_checked = voter_badge_proof.check(vbr);
             let voter_ids = badge_checked.as_non_fungible().non_fungible_local_ids();
             assert!(voter_ids.len() == 1, "Must provide exactly one voter badge");
             let voter_id = voter_ids.into_iter().next().unwrap();
 
-            // Verify tier qualification via rFOAF balance
             let rfoaf_balance = rfoaf_proof.check(self.rfoaf_resource).amount();
 
             let mut proposal = self.proposals.get_mut(&proposal_id)
@@ -241,26 +246,19 @@ mod governance_module {
             );
             assert!(
                 rfoaf_balance >= proposal.tier.voting_threshold(),
-                "Insufficient rFOAF to vote on this tier. Required: {}, held: {}",
+                "Insufficient rFOAF to vote. Required: {}, held: {}",
                 proposal.tier.voting_threshold(), rfoaf_balance
             );
 
-            // Check double-vote using (proposal_id, voter_id) key
             let vote_key = (proposal_id, voter_id.to_string());
-            assert!(
-                self.votes.get(&vote_key).is_none(),
-                "Already voted on this proposal"
-            );
+            assert!(self.votes.get(&vote_key).is_none(), "Already voted on this proposal");
 
-            // ONE vote per qualifying account — not stake-weighted
             if vote_for { proposal.votes_for += 1; } else { proposal.votes_against += 1; }
             self.votes.insert(vote_key, true);
 
             Runtime::emit_event(VoteCastEvent { proposal_id, voter_id, vote_for });
         }
 
-        /// Execute proposal after voting ends.
-        /// Quorum = max(absolute_floor, qualifying_count * pct_floor)
         pub fn execute_proposal(&mut self, proposal_id: u64) {
             let current_epoch = Runtime::current_epoch().number();
             let mut proposal = self.proposals.get_mut(&proposal_id)

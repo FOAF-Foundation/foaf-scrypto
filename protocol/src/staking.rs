@@ -54,6 +54,7 @@ mod staking_module {
             get_accrued_rheo     => PUBLIC;
             get_voter_badge_id   => PUBLIC;
             qualifying_count     => PUBLIC;
+            voter_badge_resource => PUBLIC;
             consume_rheo         => restrict_to: [protocol, admin];
             update_foaf_address  => restrict_to: [admin];
         }
@@ -406,6 +407,10 @@ mod staking_module {
 
         /// View: number of accounts qualifying for a given tier
         /// tier: 1=Tier1, 2=Tier2, 3=Tier3, 4=Tier4
+        pub fn voter_badge_resource(&self) -> ResourceAddress {
+            self.voter_badge_resource
+        }
+
         pub fn qualifying_count(&self, tier: u8) -> u64 {
             self.tier_holder_counts.get(&tier).map(|c| *c).unwrap_or(0)
         }
