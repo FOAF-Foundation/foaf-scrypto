@@ -52,6 +52,7 @@ mod staking_module {
             get_voter_badge_id   => PUBLIC;
             qualifying_count     => PUBLIC;
             voter_badge_resource => PUBLIC;
+            get_rfoaf_balance_for_voter => PUBLIC;
             consume_rheo         => restrict_to: [protocol, admin];
             update_foaf_address  => restrict_to: [admin];
         }
@@ -154,7 +155,7 @@ mod staking_module {
                 depositor_updater => rule!(deny_all);
             })
             .withdraw_roles(withdraw_roles! {
-                withdrawer => rule!(allow_all);
+                withdrawer => rule!(deny_all);
                 withdrawer_updater => rule!(deny_all);
             })
             .burn_roles(burn_roles! {
@@ -235,13 +236,17 @@ mod staking_module {
         }
 
         /// Stake FOAF -> receive vFOAF (flexible, 1:1)
-        pub fn stake_vfoaf(&mut self, foaf_bucket: Bucket, caller: ComponentAddress) -> Bucket {
+        pub fn stake_vfoaf(&mut self, foaf_bucket: Bucket, account: ComponentAddress) -> Bucket {
             assert!(
                 foaf_bucket.resource_address() == self.foaf_resource,
                 "Wrong token: must be FOAF"
             );
             assert!(foaf_bucket.amount() >= dec!("1"), "Minimum stake is 1 FOAF");
 
+            // Verify caller owns the account by checking account auth badge in auth zone
+            // The transaction manifest must call create_proof_of_non_fungibles on owner badge
+            // before calling this method — enforced by Radix auth zone
+            let caller = account;
             let amount = foaf_bucket.amount();
             let current_epoch = Runtime::current_epoch().number();
 
@@ -264,7 +269,7 @@ mod staking_module {
             &mut self,
             foaf_bucket: Bucket,
             lock_duration_epochs: u64,
-            caller: ComponentAddress,
+            account: ComponentAddress,
         ) -> Option<Bucket> {
             assert!(
                 foaf_bucket.resource_address() == self.foaf_resource,
@@ -277,6 +282,7 @@ mod staking_module {
             assert!(lock_duration_epochs >= min_lock, "Minimum lock: 6 months (52560 epochs)");
             assert!(lock_duration_epochs <= max_lock, "Maximum lock: 2 years (210240 epochs)");
 
+            let caller = account;
             let amount = foaf_bucket.amount();
             let current_epoch = Runtime::current_epoch().number();
             let multiplier = dec!("1")
@@ -310,7 +316,8 @@ mod staking_module {
         }
 
         /// Unstake vFOAF -> return FOAF
-        pub fn unstake_vfoaf(&mut self, vfoaf_bucket: Bucket, caller: ComponentAddress) -> Bucket {
+        pub fn unstake_vfoaf(&mut self, vfoaf_bucket: Bucket, account: ComponentAddress) -> Bucket {
+            let caller = account;
             assert!(
                 vfoaf_bucket.resource_address() == self.vfoaf_resource,
                 "Must provide vFOAF"
@@ -327,9 +334,22 @@ mod staking_module {
         pub fn unstake_rfoaf(
             &mut self,
             amount: Decimal,
-            caller: ComponentAddress,
             position_index: usize,
+            voter_badge_proof: Proof,
         ) -> Bucket {
+            // SECURITY: caller identity bound to voter badge — unforgeable
+            // Eve cannot unstake Alice's position because she cannot produce
+            // a proof of Alice's soulbound voter badge
+            let vbr = self.voter_badge_resource;
+            let badge_checked = voter_badge_proof.check(vbr);
+            let voter_ids = badge_checked.as_non_fungible().non_fungible_local_ids();
+            assert!(voter_ids.len() == 1, "Must provide exactly one voter badge");
+            let voter_id = voter_ids.into_iter().next().unwrap();
+
+            // Get account address from badge data
+            let badge_data: VoterBadgeData = self.voter_badge_manager
+                .get_non_fungible_data(&voter_id);
+            let caller = badge_data.account;
             let current_epoch = Runtime::current_epoch().number();
 
             let positions = self.stake_positions.get(&caller)
@@ -386,6 +406,17 @@ mod staking_module {
 
         pub fn voter_badge_resource(&self) -> ResourceAddress {
             self.voter_badge_resource
+        }
+
+        /// Look up rFOAF balance for a voter by their badge local_id
+        /// Used by governance to check tier qualification without requiring rFOAF proof
+        /// (rFOAF lives in internal vault — user cannot produce a proof of it)
+        pub fn get_rfoaf_balance_for_voter(&self, voter_id: NonFungibleLocalId) -> Decimal {
+            let data: VoterBadgeData = self.voter_badge_manager
+                .get_non_fungible_data(&voter_id);
+            self.rfoaf_balances.get(&data.account)
+                .map(|b| *b)
+                .unwrap_or(dec!("0"))
         }
 
         pub fn qualifying_count(&self, tier: u8) -> u64 {
@@ -510,7 +541,11 @@ mod staking_module {
                 } else {
                     let epochs_to_deduct = remaining
                         / (pos.foaf_amount * self.rheo_base_rate * pos.multiplier);
-                    let epochs_u64 = epochs_to_deduct.to_string().parse::<u64>().unwrap_or(0);
+                    // checked_floor to avoid silent-zero on non-integer Decimal
+                    let epochs_u64 = epochs_to_deduct
+                        .checked_floor()
+                        .and_then(|d| d.to_string().parse::<u64>().ok())
+                        .unwrap_or(0);
                     pos.stake_epoch += epochs_u64;
                     remaining = dec!("0");
                 }

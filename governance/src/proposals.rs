@@ -119,8 +119,6 @@ mod governance_module {
         /// rFOAF resource address — for tier qualification check
         rfoaf_resource: ResourceAddress,
 
-        /// Voter identity badge resource address
-
 
         /// Staking component — for qualifying_count() queries
         staking_component: ComponentAddress,
@@ -179,13 +177,23 @@ mod governance_module {
             scrypto_decode::<ResourceAddress>(&raw).unwrap()
         }
 
+        /// Fetch rFOAF balance for a voter from staking component
+        /// No rFOAF proof needed — rFOAF lives in staking vault, not user account
+        fn get_rfoaf_balance(&self, voter_id: &NonFungibleLocalId) -> Decimal {
+            let raw: Vec<u8> = ScryptoVmV1Api::object_call(
+                self.staking_component.as_node_id(),
+                "get_rfoaf_balance_for_voter",
+                scrypto_args!(voter_id.clone()),
+            );
+            scrypto_decode::<Decimal>(&raw).unwrap()
+        }
+
         pub fn submit_proposal(
             &mut self,
             title: String,
             description: String,
             tier: ProposalTier,
             voter_badge_proof: Proof,
-            rfoaf_proof: Proof,
         ) -> u64 {
             let vbr = self.get_voter_badge_res();
             let badge_checked = voter_badge_proof.check(vbr);
@@ -193,7 +201,9 @@ mod governance_module {
             assert!(voter_ids.len() == 1, "Must provide exactly one voter badge");
             let voter_id = voter_ids.into_iter().next().unwrap();
 
-            let rfoaf_balance = rfoaf_proof.check(self.rfoaf_resource).amount();
+            // Lookup rFOAF balance via staking component — no proof needed
+            // rFOAF lives in staking vault, user cannot produce a proof of it
+            let rfoaf_balance = self.get_rfoaf_balance(&voter_id);
             assert!(
                 rfoaf_balance >= tier.proposal_threshold(),
                 "Insufficient rFOAF to submit. Required: {}, held: {}",
@@ -226,7 +236,6 @@ mod governance_module {
             proposal_id: u64,
             vote_for: bool,
             voter_badge_proof: Proof,
-            rfoaf_proof: Proof,
         ) {
             let vbr = self.get_voter_badge_res();
             let badge_checked = voter_badge_proof.check(vbr);
@@ -234,7 +243,8 @@ mod governance_module {
             assert!(voter_ids.len() == 1, "Must provide exactly one voter badge");
             let voter_id = voter_ids.into_iter().next().unwrap();
 
-            let rfoaf_balance = rfoaf_proof.check(self.rfoaf_resource).amount();
+            // Lookup rFOAF balance via staking — no proof needed
+            let rfoaf_balance = self.get_rfoaf_balance(&voter_id);
 
             let mut proposal = self.proposals.get_mut(&proposal_id)
                 .expect("Proposal not found");
@@ -280,7 +290,11 @@ mod governance_module {
 
             // Scale-aware quorum: max(absolute_floor, count * pct_floor)
             let pct_quorum = Decimal::from(qualifying) * proposal.tier.pct_floor();
-            let pct_quorum_u64 = pct_quorum.to_string().parse::<u64>().unwrap_or(0);
+            // checked_floor to avoid silent-zero on non-integer Decimal
+            let pct_quorum_u64 = pct_quorum
+                .checked_floor()
+                .and_then(|d| d.to_string().parse::<u64>().ok())
+                .unwrap_or(0);
             let quorum_required = proposal.tier.abs_floor().max(pct_quorum_u64);
 
             let quorum_met = total_votes >= quorum_required;
