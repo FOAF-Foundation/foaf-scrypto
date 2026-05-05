@@ -14,10 +14,28 @@ pub struct VoterBadgeData {
     pub issued_epoch: u64,
 }
 
+/// Soulbound NFT receipt issued per vFOAF stake position
+/// Used for unstake identity proof — decoupled from rFOAF tier system
+#[derive(ScryptoSbor, NonFungibleData)]
+pub struct VStakeReceiptData {
+    pub account: ComponentAddress,
+    pub foaf_amount: Decimal,
+    pub stake_epoch: u64,
+    pub issued_epoch: u64,
+}
+
 #[derive(ScryptoSbor, ScryptoEvent)]
 pub struct RheoConsumedEvent {
     pub account: ComponentAddress,
     pub amount: Decimal,
+    pub epoch: u64,
+}
+
+#[derive(ScryptoSbor, ScryptoEvent)]
+pub struct VStakeReceiptIssuedEvent {
+    pub account: ComponentAddress,
+    pub local_id: NonFungibleLocalId,
+    pub foaf_amount: Decimal,
     pub epoch: u64,
 }
 
@@ -35,7 +53,7 @@ pub struct TierHolderCountChangedEvent {
 }
 
 #[blueprint]
-#[events(RheoConsumedEvent, VoterBadgeIssuedEvent, TierHolderCountChangedEvent)]
+#[events(RheoConsumedEvent, VStakeReceiptIssuedEvent, VoterBadgeIssuedEvent, TierHolderCountChangedEvent)]
 mod staking_module {
     enable_method_auth! {
         roles {
@@ -52,6 +70,7 @@ mod staking_module {
             get_voter_badge_id   => PUBLIC;
             qualifying_count     => PUBLIC;
             voter_badge_resource => PUBLIC;
+            vfoaf_receipt_resource => PUBLIC;
             get_rfoaf_balance_for_voter => PUBLIC;
             consume_rheo         => restrict_to: [protocol, admin];
             update_foaf_address  => restrict_to: [admin];
@@ -65,12 +84,21 @@ mod staking_module {
         rfoaf_resource: ResourceAddress,
         vfoaf_manager: FungibleResourceManager,
         rfoaf_manager: FungibleResourceManager,
+        /// vFOAF stake receipt manager — one NFT per stake position
+        vfoaf_receipt_manager: NonFungibleResourceManager,
+        vfoaf_receipt_resource: ResourceAddress,
+        next_vstake_id: u64,
+        /// Track burned/used stake receipts to prevent replay
+        used_vstake_receipts: KeyValueStore<NonFungibleLocalId, bool>,
+
         voter_badge_manager: NonFungibleResourceManager,
         voter_badge_resource: ResourceAddress,
         voter_badge_ids: KeyValueStore<ComponentAddress, NonFungibleLocalId>,
         next_voter_id: u64,
         tier_holder_counts: KeyValueStore<u8, u64>,
         rfoaf_balances: KeyValueStore<ComponentAddress, Decimal>,
+        /// Internal vault holding all vFOAF (not sent to user accounts)
+        vfoaf_vault: Vault,
         /// Internal vault holding all rFOAF receipts (not sent to user accounts)
         rfoaf_vault: Vault,
         stake_positions: KeyValueStore<ComponentAddress, Vec<StakePosition>>,
@@ -168,6 +196,37 @@ mod staking_module {
             })
             .create_with_no_initial_supply();
 
+            // vFOAF stake receipt — soulbound NFT, one per stake position
+            // Used for unstake identity proof, decoupled from rFOAF tier system
+            let vfoaf_receipt_manager: NonFungibleResourceManager =
+                ResourceBuilder::new_integer_non_fungible::<VStakeReceiptData>(
+                    OwnerRole::Fixed(rule!(require(global_caller(component_address))))
+                )
+                .metadata(metadata! {
+                    init {
+                        "name" => "FOAF vFOAF Stake Receipt", locked;
+                        "symbol" => "FOAF-VSTAKE", locked;
+                        "description" => "Soulbound stake receipt per vFOAF position. Used for unstake proof.", locked;
+                    }
+                })
+                .deposit_roles(deposit_roles! {
+                    depositor => rule!(allow_all);
+                    depositor_updater => rule!(deny_all);
+                })
+                .withdraw_roles(withdraw_roles! {
+                    withdrawer => rule!(deny_all);
+                    withdrawer_updater => rule!(deny_all);
+                })
+                .burn_roles(burn_roles! {
+                    burner => rule!(require(global_caller(component_address)));
+                    burner_updater => rule!(deny_all);
+                })
+                .mint_roles(mint_roles! {
+                    minter => rule!(require(global_caller(component_address)));
+                    minter_updater => rule!(deny_all);
+                })
+                .create_with_no_initial_supply();
+
             // Voter identity badge — soulbound NonFungible, permanent
             let voter_badge_manager: NonFungibleResourceManager =
                 ResourceBuilder::new_integer_non_fungible::<VoterBadgeData>(
@@ -200,6 +259,7 @@ mod staking_module {
 
             let vfoaf_resource = vfoaf_manager.address();
             let rfoaf_resource = rfoaf_manager.address();
+            let vfoaf_receipt_resource = vfoaf_receipt_manager.address();
             let voter_badge_resource = voter_badge_manager.address();
             let admin_badge_addr = admin_badge.resource_address();
             let protocol_badge_addr = protocol_badge.resource_address();
@@ -211,12 +271,17 @@ mod staking_module {
                 rfoaf_resource,
                 vfoaf_manager,
                 rfoaf_manager,
+                vfoaf_receipt_manager,
+                vfoaf_receipt_resource,
+                next_vstake_id: 0,
+                used_vstake_receipts: KeyValueStore::new(),
+                vfoaf_vault: Vault::new(vfoaf_resource),
+                rfoaf_vault: Vault::new(rfoaf_resource),
                 voter_badge_manager,
                 voter_badge_resource,
                 voter_badge_ids: KeyValueStore::new(),
                 next_voter_id: 0,
                 tier_holder_counts: KeyValueStore::new(),
-                rfoaf_vault: Vault::new(rfoaf_resource),
                 rfoaf_balances: KeyValueStore::new(),
                 stake_positions: KeyValueStore::new(),
                 rheo_base_rate,
@@ -236,6 +301,9 @@ mod staking_module {
         }
 
         /// Stake FOAF -> receive vFOAF (flexible, 1:1)
+        /// Stake FOAF -> receive vFOAF stake receipt NFT (soulbound, per-position)
+        /// vFOAF stored internally in component vault
+        /// Returns: vFOAF stake receipt bucket
         pub fn stake_vfoaf(&mut self, foaf_bucket: Bucket, account: ComponentAddress) -> Bucket {
             assert!(
                 foaf_bucket.resource_address() == self.foaf_resource,
@@ -243,9 +311,6 @@ mod staking_module {
             );
             assert!(foaf_bucket.amount() >= dec!("1"), "Minimum stake is 1 FOAF");
 
-            // Verify caller owns the account by checking account auth badge in auth zone
-            // The transaction manifest must call create_proof_of_non_fungibles on owner badge
-            // before calling this method — enforced by Radix auth zone
             let caller = account;
             let amount = foaf_bucket.amount();
             let current_epoch = Runtime::current_epoch().number();
@@ -260,7 +325,30 @@ mod staking_module {
             });
             self.stake_positions.insert(caller, positions);
             self.foaf_vault.put(foaf_bucket);
-            self.vfoaf_manager.mint(amount).into()
+
+            // Mint vFOAF internally (stored in component vault)
+            let vfoaf_bucket: Bucket = self.vfoaf_manager.mint(amount).into();
+            self.vfoaf_vault.put(vfoaf_bucket);
+
+            // Issue soulbound stake receipt NFT — used for unstake identity proof
+            let receipt_id = NonFungibleLocalId::integer(self.next_vstake_id);
+            self.next_vstake_id += 1;
+            let receipt = self.vfoaf_receipt_manager.mint_non_fungible(
+                &receipt_id,
+                VStakeReceiptData {
+                    account: caller,
+                    foaf_amount: amount,
+                    stake_epoch: current_epoch,
+                    issued_epoch: current_epoch,
+                },
+            );
+            Runtime::emit_event(VStakeReceiptIssuedEvent {
+                account: caller,
+                local_id: receipt_id,
+                foaf_amount: amount,
+                epoch: current_epoch,
+            });
+            receipt.into()
         }
 
         /// Stake FOAF -> receive voter badge if first time crossing Tier 1
@@ -316,15 +404,38 @@ mod staking_module {
         }
 
         /// Unstake vFOAF -> return FOAF
-        pub fn unstake_vfoaf(&mut self, vfoaf_bucket: Bucket, account: ComponentAddress) -> Bucket {
-            let caller = account;
+        /// Requires stake receipt NFT proof — identity bound to soulbound receipt
+        pub fn unstake_vfoaf(&mut self, receipt_proof: Proof) -> Bucket {
+            let receipt_checked = receipt_proof.check(self.vfoaf_receipt_resource);
+            let receipt_ids = receipt_checked.as_non_fungible().non_fungible_local_ids();
+            assert!(receipt_ids.len() == 1, "Must provide exactly one stake receipt");
+            let receipt_id = receipt_ids.into_iter().next().unwrap();
+
+            // Prevent replay: check receipt not already used
             assert!(
-                vfoaf_bucket.resource_address() == self.vfoaf_resource,
-                "Must provide vFOAF"
+                self.used_vstake_receipts.get(&receipt_id).is_none(),
+                "Stake receipt already used"
             );
-            let amount = vfoaf_bucket.amount();
+            // Mark receipt as used immediately
+            self.used_vstake_receipts.insert(receipt_id.clone(), true);
+
+            // Get position data from receipt NFT
+            let receipt_data: VStakeReceiptData = self.vfoaf_receipt_manager
+                .get_non_fungible_data(&receipt_id);
+            let caller = receipt_data.account;
+            let amount = receipt_data.foaf_amount;
+
             self.remove_stake_position(caller, amount, 0);
+
+            // Burn vFOAF from internal vault
+            let vfoaf_bucket = self.vfoaf_vault.take(amount);
             self.vfoaf_manager.burn(vfoaf_bucket);
+
+            // Drop the proof — receipt NFT remains in user account
+            // but stake position is removed, so it cannot be used again
+            // (unstake_vfoaf verifies against active stake positions)
+            drop(receipt_checked);
+
             self.foaf_vault.take(amount)
         }
 
@@ -406,6 +517,10 @@ mod staking_module {
 
         pub fn voter_badge_resource(&self) -> ResourceAddress {
             self.voter_badge_resource
+        }
+
+        pub fn vfoaf_receipt_resource(&self) -> ResourceAddress {
+            self.vfoaf_receipt_resource
         }
 
         /// Look up rFOAF balance for a voter by their badge local_id
