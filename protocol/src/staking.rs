@@ -2,6 +2,7 @@ use scrypto::prelude::*;
 
 #[derive(ScryptoSbor, Clone, Debug)]
 pub struct StakePosition {
+    pub position_id: u64,
     pub foaf_amount: Decimal,
     pub stake_epoch: u64,
     pub lock_duration_epochs: u64,
@@ -19,6 +20,7 @@ pub struct VoterBadgeData {
 #[derive(ScryptoSbor, NonFungibleData)]
 pub struct VStakeReceiptData {
     pub account: ComponentAddress,
+    pub position_id: u64,
     pub foaf_amount: Decimal,
     pub stake_epoch: u64,
     pub issued_epoch: u64,
@@ -88,6 +90,7 @@ mod staking_module {
         vfoaf_receipt_manager: NonFungibleResourceManager,
         vfoaf_receipt_resource: ResourceAddress,
         next_vstake_id: u64,
+        next_position_id: u64,
         /// Track burned/used stake receipts to prevent replay
         used_vstake_receipts: KeyValueStore<NonFungibleLocalId, bool>,
 
@@ -274,6 +277,7 @@ mod staking_module {
                 vfoaf_receipt_manager,
                 vfoaf_receipt_resource,
                 next_vstake_id: 0,
+                next_position_id: 0,
                 used_vstake_receipts: KeyValueStore::new(),
                 vfoaf_vault: Vault::new(vfoaf_resource),
                 rfoaf_vault: Vault::new(rfoaf_resource),
@@ -315,9 +319,13 @@ mod staking_module {
             let amount = foaf_bucket.amount();
             let current_epoch = Runtime::current_epoch().number();
 
+            let position_id = self.next_position_id;
+            self.next_position_id += 1;
+
             let mut positions = self.stake_positions
                 .get_mut(&caller).map(|p| p.clone()).unwrap_or_default();
             positions.push(StakePosition {
+                position_id,
                 foaf_amount: amount,
                 stake_epoch: current_epoch,
                 lock_duration_epochs: 0,
@@ -326,17 +334,18 @@ mod staking_module {
             self.stake_positions.insert(caller, positions);
             self.foaf_vault.put(foaf_bucket);
 
-            // Mint vFOAF internally (stored in component vault)
+            // Mint vFOAF internally
             let vfoaf_bucket: Bucket = self.vfoaf_manager.mint(amount).into();
             self.vfoaf_vault.put(vfoaf_bucket);
 
-            // Issue soulbound stake receipt NFT — used for unstake identity proof
+            // Issue soulbound stake receipt NFT — 1:1 with position via position_id
             let receipt_id = NonFungibleLocalId::integer(self.next_vstake_id);
             self.next_vstake_id += 1;
             let receipt = self.vfoaf_receipt_manager.mint_non_fungible(
                 &receipt_id,
                 VStakeReceiptData {
                     account: caller,
+                    position_id,
                     foaf_amount: amount,
                     stake_epoch: current_epoch,
                     issued_epoch: current_epoch,
@@ -376,9 +385,13 @@ mod staking_module {
             let multiplier = dec!("1")
                 + dec!("3") * Decimal::from(lock_duration_epochs) / Decimal::from(max_lock);
 
+            let position_id = self.next_position_id;
+            self.next_position_id += 1;
+
             let mut positions = self.stake_positions
                 .get_mut(&caller).map(|p| p.clone()).unwrap_or_default();
             positions.push(StakePosition {
+                position_id,
                 foaf_amount: amount,
                 stake_epoch: current_epoch,
                 lock_duration_epochs,
@@ -425,15 +438,14 @@ mod staking_module {
             let caller = receipt_data.account;
             let amount = receipt_data.foaf_amount;
 
-            self.remove_stake_position(caller, amount, 0);
+            // Remove by exact position_id — receipt maps 1:1 to position
+            self.remove_stake_position_by_id(caller, receipt_data.position_id);
 
             // Burn vFOAF from internal vault
             let vfoaf_bucket = self.vfoaf_vault.take(amount);
             self.vfoaf_manager.burn(vfoaf_bucket);
 
-            // Drop the proof — receipt NFT remains in user account
-            // but stake position is removed, so it cannot be used again
-            // (unstake_vfoaf verifies against active stake positions)
+            // Drop proof — receipt stays in user account, replay blocked by used_vstake_receipts
             drop(receipt_checked);
 
             self.foaf_vault.take(amount)
@@ -619,17 +631,15 @@ mod staking_module {
             }
         }
 
-        fn remove_stake_position(
+        fn remove_stake_position_by_id(
             &mut self,
             account: ComponentAddress,
-            amount: Decimal,
-            lock_duration: u64,
+            position_id: u64,
         ) {
             let mut positions = self.stake_positions.get(&account)
                 .map(|p| p.clone()).unwrap_or_default();
-            let idx = positions.iter().position(|p| {
-                p.foaf_amount == amount && p.lock_duration_epochs == lock_duration
-            }).expect("Stake position not found");
+            let idx = positions.iter().position(|p| p.position_id == position_id)
+                .expect("Stake position not found for given position_id");
             positions.remove(idx);
             self.stake_positions.insert(account, positions);
         }
