@@ -64,6 +64,18 @@ impl ProposalTier {
 #[derive(ScryptoSbor, Clone, Debug, PartialEq)]
 pub enum ProposalStatus { Active, Passed, Failed, Executed }
 
+/// On-chain executable action attached to a proposal.
+/// Initially supports treasury disbursement; extend as governance scope grows.
+#[derive(ScryptoSbor, Clone, Debug)]
+pub enum ExecutionAction {
+    /// No on-chain effect. Use for signaling, statements of intent, etc.
+    Signal,
+    /// Disburse FOAF from the treasury to a specific recipient.
+    TreasuryDisburse { amount: Decimal, recipient: ComponentAddress },
+    /// Release the treasury emergency lock. Requires governance role on treasury.
+    TreasuryEmergencyUnlock,
+}
+
 #[derive(ScryptoSbor, Clone, Debug)]
 pub struct Proposal {
     pub id: u64,
@@ -76,6 +88,7 @@ pub struct Proposal {
     pub votes_for: u64,
     pub votes_against: u64,
     pub status: ProposalStatus,
+    pub action: ExecutionAction,
 }
 
 #[derive(ScryptoSbor, ScryptoEvent)]
@@ -104,31 +117,31 @@ mod governance_module {
             council => updatable_by: [OWNER];
         },
         methods {
-            submit_proposal      => PUBLIC;
-            vote                 => PUBLIC;
-            execute_proposal     => PUBLIC;
-            get_proposal         => PUBLIC;
-            list_proposals       => PUBLIC;
-            get_qualifying_tiers => PUBLIC;
-            set_treasury         => restrict_to: [admin];
-            set_staking          => restrict_to: [admin];
+            submit_proposal  => PUBLIC;
+            vote             => PUBLIC;
+            execute_proposal => PUBLIC;
+            get_proposal     => PUBLIC;
+            list_proposals   => PUBLIC;
+            set_treasury     => restrict_to: [admin];
+            // set_staking deliberately omitted: rebinding the rFOAF oracle post-hoc
+            // would let admin rewrite vote weights for in-flight proposals. The staking
+            // component address is fixed at instantiate-time. If migration is ever needed,
+            // it has to flow through a governance proposal that redeploys this component.
         }
     }
 
     struct FoafGovernance {
-        /// rFOAF resource address — for tier qualification check
-        rfoaf_resource: ResourceAddress,
-
-
-        /// Staking component — for qualifying_count() queries
+        /// Staking component — source of truth for rFOAF balances and tier counts.
+        /// Fixed at instantiate-time; cannot be changed without redeploy.
         staking_component: ComponentAddress,
 
         proposals: KeyValueStore<u64, Proposal>,
         proposal_count: u64,
 
-        /// voters per proposal: proposal_id -> voter_local_id -> voted
-        /// KeyValueStore<(proposal_id, voter_local_id_string), bool>
-        votes: KeyValueStore<(u64, String), bool>,
+        /// Votes are keyed by (proposal_id, voter_local_id) using the typed local_id
+        /// directly. Previous version stringified the id, which was fragile against
+        /// Scrypto formatting changes.
+        votes: KeyValueStore<(u64, NonFungibleLocalId), bool>,
 
         admin_badge: ResourceAddress,
         council_badge: ResourceAddress,
@@ -137,8 +150,6 @@ mod governance_module {
 
     impl FoafGovernance {
         pub fn instantiate(
-            rfoaf_resource: ResourceAddress,
-    
             staking_component: ComponentAddress,
             admin_badge: ResourceAddress,
             council_badge: ResourceAddress,
@@ -146,8 +157,6 @@ mod governance_module {
             let (address_reservation, _) =
                 Runtime::allocate_component_address(FoafGovernance::blueprint_id());
             Self {
-                rfoaf_resource,
-    
                 staking_component,
                 proposals: KeyValueStore::new(),
                 proposal_count: 0,
@@ -193,6 +202,7 @@ mod governance_module {
             title: String,
             description: String,
             tier: ProposalTier,
+            action: ExecutionAction,
             voter_badge_proof: Proof,
         ) -> u64 {
             let vbr = self.get_voter_badge_res();
@@ -210,6 +220,19 @@ mod governance_module {
                 tier.proposal_threshold(), rfoaf_balance
             );
 
+            // Validate that the action is consistent with the tier. Treasury and
+            // emergency actions require Tier 3+; signaling is open to any tier.
+            match &action {
+                ExecutionAction::Signal => {}
+                ExecutionAction::TreasuryDisburse { .. }
+                | ExecutionAction::TreasuryEmergencyUnlock => {
+                    assert!(
+                        matches!(tier, ProposalTier::Tier3 | ProposalTier::Tier4),
+                        "Treasury actions require Tier 3 or Tier 4"
+                    );
+                }
+            }
+
             let current_epoch = Runtime::current_epoch().number();
             let id = self.proposal_count;
             self.proposal_count += 1;
@@ -225,6 +248,7 @@ mod governance_module {
                 votes_for: 0,
                 votes_against: 0,
                 status: ProposalStatus::Active,
+                action,
             });
 
             Runtime::emit_event(ProposalCreatedEvent { id, tier, epoch: current_epoch });
@@ -260,7 +284,7 @@ mod governance_module {
                 proposal.tier.voting_threshold(), rfoaf_balance
             );
 
-            let vote_key = (proposal_id, voter_id.to_string());
+            let vote_key = (proposal_id, voter_id.clone());
             assert!(self.votes.get(&vote_key).is_none(), "Already voted on this proposal");
 
             if vote_for { proposal.votes_for += 1; } else { proposal.votes_against += 1; }
@@ -271,39 +295,57 @@ mod governance_module {
 
         pub fn execute_proposal(&mut self, proposal_id: u64) {
             let current_epoch = Runtime::current_epoch().number();
-            let mut proposal = self.proposals.get_mut(&proposal_id)
-                .expect("Proposal not found");
 
-            assert!(proposal.status == ProposalStatus::Active, "Proposal already processed");
-            assert!(current_epoch > proposal.voting_end_epoch, "Voting period has not ended");
+            // Read-only scope: decide pass/fail without holding a mutable borrow
+            // across the cross-component execution call below.
+            let (passed, quorum_required, action, tier_idx) = {
+                let proposal = self.proposals.get(&proposal_id)
+                    .expect("Proposal not found");
+                assert!(proposal.status == ProposalStatus::Active, "Proposal already processed");
+                assert!(current_epoch > proposal.voting_end_epoch, "Voting period has not ended");
 
-            let total_votes = proposal.votes_for + proposal.votes_against;
+                let total_votes = proposal.votes_for + proposal.votes_against;
+                let tier_index = proposal.tier.tier_index();
+                let qualifying_raw: Vec<u8> = ScryptoVmV1Api::object_call(
+                    self.staking_component.as_node_id(),
+                    "qualifying_count",
+                    scrypto_args!(tier_index),
+                );
+                let qualifying: u64 = scrypto_decode(&qualifying_raw)
+                    .expect("Failed to decode qualifying_count");
 
-            // Query qualifying_count from staking component
-            let tier_index = proposal.tier.tier_index();
-            let qualifying_raw: Vec<u8> = ScryptoVmV1Api::object_call(
-                self.staking_component.as_node_id(),
-                "qualifying_count",
-                scrypto_args!(tier_index),
-            );
-            let qualifying: u64 = scrypto_decode(&qualifying_raw).expect("Failed to decode qualifying_count");
+                // Scale-aware quorum: max(absolute_floor, count * pct_floor)
+                let pct_quorum = Decimal::from(qualifying) * proposal.tier.pct_floor();
+                let pct_quorum_u64 = decimal_floor_to_u64(pct_quorum);
+                let quorum_required = proposal.tier.abs_floor().max(pct_quorum_u64);
 
-            // Scale-aware quorum: max(absolute_floor, count * pct_floor)
-            let pct_quorum = Decimal::from(qualifying) * proposal.tier.pct_floor();
-            // checked_floor to avoid silent-zero on non-integer Decimal
-            let pct_quorum_u64 = pct_quorum
-                .checked_floor()
-                .and_then(|d| d.to_string().parse::<u64>().ok())
-                .unwrap_or(0);
-            let quorum_required = proposal.tier.abs_floor().max(pct_quorum_u64);
+                let quorum_met = total_votes >= quorum_required;
+                let passed = quorum_met && total_votes > 0 && {
+                    let ratio = Decimal::from(proposal.votes_for) / Decimal::from(total_votes);
+                    ratio >= proposal.tier.pass_threshold()
+                };
 
-            let quorum_met = total_votes >= quorum_required;
-            let passed = quorum_met && total_votes > 0 && {
-                let ratio = Decimal::from(proposal.votes_for) / Decimal::from(total_votes);
-                ratio >= proposal.tier.pass_threshold()
+                (passed, quorum_required, proposal.action.clone(), tier_index)
             };
 
-            proposal.status = if passed { ProposalStatus::Passed } else { ProposalStatus::Failed };
+            // Perform the on-chain action only if the proposal passed.
+            // For Signal proposals there is no on-chain effect; the status change is
+            // the only outcome.
+            let executed = if passed {
+                self.perform_action(&action);
+                true
+            } else { false };
+
+            // Write back final status. Passed-and-executed proposals become Executed;
+            // passed-but-no-op (Signal) proposals become Passed; failures Failed.
+            let mut proposal = self.proposals.get_mut(&proposal_id)
+                .expect("Proposal not found");
+            proposal.status = match (passed, executed, &action) {
+                (true, true, ExecutionAction::Signal) => ProposalStatus::Passed,
+                (true, true, _) => ProposalStatus::Executed,
+                (true, false, _) => ProposalStatus::Passed,
+                (false, _, _) => ProposalStatus::Failed,
+            };
 
             Runtime::emit_event(ProposalExecutedEvent {
                 proposal_id, passed,
@@ -311,17 +353,35 @@ mod governance_module {
                 votes_against: proposal.votes_against,
                 quorum_required,
             });
+
+            // tier_idx kept around for potential future per-tier execution telemetry
+            let _ = tier_idx;
         }
 
-        /// View: which tiers does an account qualify for given rFOAF proof
-        pub fn get_qualifying_tiers(&self, rfoaf_proof: Proof) -> Vec<ProposalTier> {
-            let balance = rfoaf_proof.check(self.rfoaf_resource).amount();
-            let mut tiers = Vec::new();
-            if balance >= TIER_1_VOTE { tiers.push(ProposalTier::Tier1); }
-            if balance >= TIER_2_VOTE { tiers.push(ProposalTier::Tier2); }
-            if balance >= TIER_3_VOTE { tiers.push(ProposalTier::Tier3); }
-            if balance >= TIER_4_VOTE { tiers.push(ProposalTier::Tier4); }
-            tiers
+        /// Internal: dispatch the proposal's action via the appropriate downstream
+        /// component. Governance holds the council badge that authorizes treasury calls.
+        fn perform_action(&self, action: &ExecutionAction) {
+            match action {
+                ExecutionAction::Signal => {}
+                ExecutionAction::TreasuryDisburse { amount, recipient } => {
+                    let treasury = self.treasury_component
+                        .expect("Treasury not wired");
+                    let _raw: Vec<u8> = ScryptoVmV1Api::object_call(
+                        treasury.as_node_id(),
+                        "disburse",
+                        scrypto_args!(*amount, *recipient),
+                    );
+                }
+                ExecutionAction::TreasuryEmergencyUnlock => {
+                    let treasury = self.treasury_component
+                        .expect("Treasury not wired");
+                    let _raw: Vec<u8> = ScryptoVmV1Api::object_call(
+                        treasury.as_node_id(),
+                        "emergency_unlock",
+                        scrypto_args!(),
+                    );
+                }
+            }
         }
 
         pub fn get_proposal(&self, id: u64) -> Proposal {
@@ -335,11 +395,23 @@ mod governance_module {
         }
 
         pub fn set_treasury(&mut self, treasury: ComponentAddress) {
+            assert!(self.treasury_component.is_none(),
+                "Treasury already wired; cannot rebind");
             self.treasury_component = Some(treasury);
         }
+    }
+}
 
-        pub fn set_staking(&mut self, staking: ComponentAddress) {
-            self.staking_component = staking;
-        }
+/// Convert a Decimal to a u64 by flooring, returning 0 on overflow or negative input.
+/// Bounded through i128 to catch values outside u64 range cleanly.
+fn decimal_floor_to_u64(d: Decimal) -> u64 {
+    match d.checked_floor() {
+        Some(floored) => floored
+            .to_string()
+            .parse::<i128>()
+            .ok()
+            .and_then(|i| u64::try_from(i.max(0)).ok())
+            .unwrap_or(0),
+        None => 0,
     }
 }

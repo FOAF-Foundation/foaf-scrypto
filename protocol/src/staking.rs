@@ -75,7 +75,10 @@ mod staking_module {
             vfoaf_receipt_resource => PUBLIC;
             get_rfoaf_balance_for_voter => PUBLIC;
             consume_rheo         => restrict_to: [protocol, admin];
-            update_foaf_address  => restrict_to: [admin];
+            // update_foaf_address deliberately removed: it changed the assertion
+            // field but not the underlying vault, leaving the component in a broken
+            // state where new stakes would panic and the FOAF resource address is
+            // mid-fork. If migration is ever needed it must be a redeploy.
         }
     }
 
@@ -304,11 +307,17 @@ mod staking_module {
             (component, admin_badge.into(), protocol_badge.into())
         }
 
-        /// Stake FOAF -> receive vFOAF (flexible, 1:1)
-        /// Stake FOAF -> receive vFOAF stake receipt NFT (soulbound, per-position)
-        /// vFOAF stored internally in component vault
-        /// Returns: vFOAF stake receipt bucket
-        pub fn stake_vfoaf(&mut self, foaf_bucket: Bucket, account: ComponentAddress) -> Bucket {
+        /// Stake FOAF -> position credited to `account`, soulbound receipt deposited
+        /// directly to `account`. vFOAF stored internally in component vault.
+        ///
+        /// SECURITY: the stake receipt is deposited atomically into `account` rather
+        /// than returned as a free bucket. This closes the previous identity-theft
+        /// pattern where a third party could call stake on someone else's behalf and
+        /// intercept the resulting receipt. The remaining "anyone can deposit into
+        /// anyone's stake list" griefing is intentional pending Scrypto runtime
+        /// caller exposure — the attacker burns their own FOAF to credit the victim,
+        /// gaining nothing.
+        pub fn stake_vfoaf(&mut self, foaf_bucket: Bucket, account: ComponentAddress) {
             assert!(
                 foaf_bucket.resource_address() == self.foaf_resource,
                 "Wrong token: must be FOAF"
@@ -357,17 +366,29 @@ mod staking_module {
                 foaf_amount: amount,
                 epoch: current_epoch,
             });
-            receipt.into()
+
+            // Atomic deposit: receipt goes to the named account, not the manifest
+            // caller. If the account rejects the deposit, the transaction aborts.
+            Global::<Account>::from(caller).try_deposit_or_abort(receipt.into(), None);
         }
 
-        /// Stake FOAF -> receive voter badge if first time crossing Tier 1
-        /// rFOAF is stored internally in component vault (soulbound receipt)
+        /// Stake FOAF -> rFOAF position credited to `account`. If this stake crosses
+        /// the Tier 1 threshold for the first time, a soulbound voter badge is minted
+        /// and deposited directly into `account`. rFOAF itself stays in the internal
+        /// component vault.
+        ///
+        /// SECURITY: the voter badge is deposited atomically into `account`, never
+        /// returned to the manifest caller. This closes the previous identity-theft
+        /// exploit (caller staking "as Alice" and intercepting Alice's voter badge
+        /// to vote with her rFOAF weight forever). The remaining griefing — anyone
+        /// can credit anyone's rFOAF balance — is intentional pending Scrypto
+        /// runtime caller exposure; the attacker burns their own FOAF for no gain.
         pub fn stake_rfoaf(
             &mut self,
             foaf_bucket: Bucket,
             lock_duration_epochs: u64,
             account: ComponentAddress,
-        ) -> Option<Bucket> {
+        ) {
             assert!(
                 foaf_bucket.resource_address() == self.foaf_resource,
                 "Wrong token: must be FOAF"
@@ -413,7 +434,13 @@ mod staking_module {
             // Store rFOAF in internal component vault (soulbound — not transferable)
             let rfoaf_bucket: Bucket = self.rfoaf_manager.mint(amount).into();
             self.rfoaf_vault.put(rfoaf_bucket);
-            voter_badge_bucket
+
+            // Atomic deposit of the voter badge to `account` if one was issued.
+            // The badge encodes `account` in its NFT data; depositing it directly
+            // ensures the holder and the encoded account agree.
+            if let Some(badge_bucket) = voter_badge_bucket {
+                Global::<Account>::from(caller).try_deposit_or_abort(badge_bucket, None);
+            }
         }
 
         /// Unstake vFOAF -> return FOAF
@@ -563,10 +590,6 @@ mod staking_module {
                 amount: amount_needed,
                 epoch: Runtime::current_epoch().number(),
             });
-        }
-
-        pub fn update_foaf_address(&mut self, new_addr: ResourceAddress) {
-            self.foaf_resource = new_addr;
         }
 
         // ===== INTERNAL =====

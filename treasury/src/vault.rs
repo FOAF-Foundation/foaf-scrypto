@@ -9,17 +9,19 @@ mod treasury_module {
             governance => updatable_by: [OWNER];
         },
         methods {
-            deposit        => restrict_to: [admin];
-            disburse       => restrict_to: [governance];
-            get_balance    => PUBLIC;
-            emergency_lock => restrict_to: [admin];
+            deposit          => restrict_to: [admin];
+            disburse         => restrict_to: [governance];
+            get_balance      => PUBLIC;
+            emergency_lock   => restrict_to: [admin];
+            emergency_unlock => restrict_to: [governance];
         }
     }
 
     struct FoafTreasury {
         /// Main vault — holds the Foundation FOAF reserve (3M FOAF, 12% of supply)
         foaf_vault: Vault,
-        /// When true, all disbursements are halted
+        /// When true, all disbursements are halted. Set by admin (emergency_lock),
+        /// cleared only by governance (emergency_unlock) to prevent single-admin abuse.
         locked: bool,
         admin_badge: ResourceAddress,
         governance_badge: ResourceAddress,
@@ -52,31 +54,47 @@ mod treasury_module {
             .globalize()
         }
 
-        /// Deposit FOAF into the treasury (admin only)
+        /// Deposit FOAF into the treasury (admin only).
         pub fn deposit(&mut self, foaf_bucket: Bucket) {
             assert!(!self.locked, "Treasury is in emergency lock mode");
             self.foaf_vault.put(foaf_bucket);
         }
 
         /// Disburse FOAF following a passed governance proposal.
-        /// Execution flows from proposal -> governance component -> this method, atomic on-chain.
-        pub fn disburse(&mut self, amount: Decimal, recipient: ComponentAddress) -> Bucket {
+        /// Deposits atomically into the recipient account; does NOT return a free Bucket
+        /// so the caller cannot redirect the funds elsewhere.
+        pub fn disburse(&mut self, amount: Decimal, recipient: ComponentAddress) {
             assert!(!self.locked, "Treasury is in emergency lock mode");
             assert!(self.foaf_vault.amount() >= amount, "Insufficient treasury balance");
+            assert!(amount > dec!("0"), "Disbursement amount must be positive");
+
+            let bucket = self.foaf_vault.take(amount);
             self.total_disbursed += amount;
-            Runtime::emit_event(TreasuryDisbursementEvent {
-                recipient, amount,
-                remaining: self.foaf_vault.amount() - amount,
-            });
-            self.foaf_vault.take(amount)
+
+            let remaining = self.foaf_vault.amount();
+            Runtime::emit_event(TreasuryDisbursementEvent { recipient, amount, remaining });
+
+            // Atomic deposit into the recipient account. If the recipient rejects the
+            // deposit (default-deny rule, etc.), the entire transaction aborts and the
+            // disburse call has no effect.
+            Global::<Account>::from(recipient).try_deposit_or_abort(bucket, None);
         }
 
         pub fn get_balance(&self) -> Decimal { self.foaf_vault.amount() }
 
-        /// Toggle emergency lock — halts all disbursements when true
-        pub fn emergency_lock(&mut self, lock: bool) {
-            self.locked = lock;
-            Runtime::emit_event(EmergencyLockEvent { locked: lock });
+        /// Engage emergency lock — admin can halt disbursements unilaterally.
+        /// Designed to be one-way: only governance can unlock (see emergency_unlock).
+        pub fn emergency_lock(&mut self) {
+            self.locked = true;
+            Runtime::emit_event(EmergencyLockEvent { locked: true });
+        }
+
+        /// Release emergency lock — gated to governance so a compromised admin
+        /// cannot lock-then-drain by toggling. Requires a passed governance proposal
+        /// to be the caller via the governance role.
+        pub fn emergency_unlock(&mut self) {
+            self.locked = false;
+            Runtime::emit_event(EmergencyLockEvent { locked: false });
         }
     }
 }
